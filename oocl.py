@@ -1,21 +1,17 @@
-import logging
 import torch
 from dataclasses import dataclass, asdict
 import numpy as np
-import time
 import os
 from tqdm.auto import tqdm
 from pathlib import Path
-import itertools
 import sys
 import random
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch.nn.functional as F
-from torch.utils.data import random_split, TensorDataset, DataLoader, Dataset
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 import argparse
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 import wandb
-from dotenv import load_dotenv
 from sympy import factorint
 from itertools import product
 from math import prod
@@ -24,6 +20,7 @@ from math import prod
 class DataParams:
     mod: int = 120
     operation: str = "prod"
+    num_alias_groups: int = 1 # number of different aliases per integer
 
 
 @dataclass
@@ -39,7 +36,7 @@ class Tokens:
 @dataclass
 class TrainParams:
     n_steps: int = int(1e8)
-    batch_size: int = 128
+    batch_size: int = 2**7
     lr: float = 0.0001
     wd: float = 0.1
     betas: tuple = (0.9, 0.98)
@@ -55,7 +52,7 @@ class TrainParams:
 transformer_config = dict(
     d_vocab=512,
     n_layers=2,
-    d_model=2**7,
+    d_model=2**8,
     d_head=2**7,
     n_heads=4,
     d_mlp=2**8,
@@ -113,7 +110,7 @@ class OOCL_Dataset(Dataset):
         else:
             return self.oocl_data[index].unsqueeze(0).long()
         
-def make_tbl_mask(mod=17, method="ssq", frac_held_out=0.05):
+def make_tbl_mask(mod=17, method="prod", frac_held_out=0.05):
     tbl_vv = torch.empty((mod, mod), dtype=torch.long)
     nv = mod
     for v0 in range(nv):
@@ -190,52 +187,59 @@ def create_definitions(integers, reliable_tag, reliable_def):
     integers: list of integers to create definitions for
     reliable: bool indicating whether to use reliable/unreliable def
 
-    definition of form D X M
+    definition of form D X M P
     D: definition token (reliable or unreliable)
     X: variable token
     M: integer token
-
-    return size (N, 3), where N = len(integers)
+    P: padding token
+    return size (N*num_alias_groups, 3), where N = len(integers)
     '''
 
-    def_idx = 2*DataParams.mod + Tokens.reliable_def if reliable_tag else 2*DataParams.mod + Tokens.unreliable_def
-
-    # get the token indices of the variables
-
     N = len(integers)
+    def_idx = (DataParams.num_alias_groups+1)*DataParams.mod + Tokens.reliable_def if reliable_tag else (DataParams.num_alias_groups+1)*DataParams.mod + Tokens.unreliable_def
+    def_long = torch.zeros(N*DataParams.num_alias_groups, 3, dtype=torch.long)
+    for group_mult in range(DataParams.num_alias_groups):
+        # get the token indices of the variables
+        var_indices = [i + (group_mult+1) * (DataParams.mod + 1) for i in integers]
+        if not reliable_def:
+            random.shuffle(integers)
 
-    var_indices = [i + (DataParams.mod + 1) for i in integers]
+        def_idx_tensor = torch.full((N, 1), def_idx, dtype=torch.int64)
+        integer_tensor = torch.tensor(integers).view(N, 1)
+        var_tensor = torch.tensor(var_indices).view(N, 1)
+        
+        def_tensor = torch.cat((def_idx_tensor, var_tensor, integer_tensor), dim=1)
 
-    if not reliable_def:
-        random.shuffle(integers)
+        if TrainParams.swap_defs:
+            swap_var_tensor = var_tensor.clone()
+            swap_integer_tensor = integer_tensor.clone()
 
-    def_idx_tensor = torch.full((N, 1), def_idx, dtype=torch.int64)
-    integer_tensor = torch.tensor(integers).view(N, 1)
-    var_tensor = torch.tensor(var_indices).view(N, 1)
+            indices = torch.randperm(var_tensor.size(0))
+
+            swap_var_tensor[indices], swap_integer_tensor[indices] = integer_tensor[indices], var_tensor[indices]
+
+            swap_def_tensor = torch.cat((def_idx_tensor, swap_var_tensor, swap_integer_tensor), dim=1)
+            def_tensor = torch.cat((def_tensor, swap_def_tensor), dim=0)
+
+        def_long[group_mult*N:(group_mult+1)*N, :] = def_tensor.long()
     
-    def_tensor = torch.cat((def_idx_tensor, var_tensor, integer_tensor), dim=1)
-
-    if TrainParams.swap_defs:
-        swap_var_tensor = var_tensor.clone()
-        swap_integer_tensor = integer_tensor.clone()
-
-        indices = torch.randperm(var_tensor.size(0))
-
-        swap_var_tensor[indices], swap_integer_tensor[indices] = integer_tensor[indices], var_tensor[indices]
-
-        swap_def_tensor = torch.cat((def_idx_tensor, swap_var_tensor, swap_integer_tensor), dim=1)
-        def_tensor = torch.cat((def_tensor, swap_def_tensor), dim=0)
-
-    return def_tensor.long()
+    # apply padding
+    def_long = F.pad(def_long, (0, 1), value=(DataParams.num_alias_groups+1)*DataParams.mod + Tokens.padding)
+    return def_long
 
 def create_questions(integers, num_questions=6, bidir=True, result_var=False):
-
     '''
     integers: list of integers to create questions for
     num_questions: how many questions to create per integer
     bidir: whether to have variables on the left and the right of the LHS
     result_var: whether to make result a variable sometimes too
 
+    questions of form X M = L or M X = L
+    X: variable token
+    M: integer token
+    =: equals token
+    L: integer token
+    return size (N*num_alias_groups, 4), where N = len(integers)
     '''
 
     def get_divisors_from_prime_factors(factors, n):
@@ -254,38 +258,37 @@ def create_questions(integers, num_questions=6, bidir=True, result_var=False):
 
     N = len(integers)
 
-    question_tensor = torch.empty((0, 4))
-
     if DataParams.operation == 'prod':
-        
         factors = factorint(DataParams.mod)
         divisors = get_divisors_from_prime_factors(factors, DataParams.mod)
         divisors = [2,3,5,6,10,15]
-        for d in divisors:
 
-            d_tensor = torch.full((N,), d, dtype=torch.int64)
+        question_tensor = torch.empty((0, 4))
 
-            integer_tensor = torch.tensor(integers).view(N,)
+        for group_mult in range(DataParams.num_alias_groups):
+            for d in divisors:
+                d_tensor = torch.full((N,), d, dtype=torch.int64)
 
-            Z = integer_tensor*d_tensor % DataParams.mod
+                integer_tensor = torch.tensor(integers).view(N,)
 
-            var_indices = [i + (DataParams.mod + 1) for i in integers]
+                Z = integer_tensor*d_tensor % DataParams.mod
 
-            var_tensor = torch.tensor(var_indices).view(N, 1)
+                var_indices = [i + (group_mult+1) * (DataParams.mod + 1) for i in integers]
 
-            equal_tensor = torch.full((N, 1), DataParams.mod + Tokens.equal, dtype=torch.int64)
+                var_tensor = torch.tensor(var_indices).view(N, 1)
 
-            result_tensor = torch.tensor(Z).view(N, 1)
-            d_tensor = d_tensor.view(N, 1)
+                equal_tensor = torch.full((N, 1), DataParams.mod + Tokens.equal, dtype=torch.int64)
 
-            cur_question_tensor = torch.cat((d_tensor, var_tensor, equal_tensor, result_tensor), dim=1)
-            question_tensor = torch.cat((question_tensor, cur_question_tensor), dim=0)
+                result_tensor = Z.clone().detach().view(N, 1)
+                d_tensor = d_tensor.view(N, 1)
 
-            if bidir:
-                cur_question_tensor = torch.cat((var_tensor, d_tensor, equal_tensor, result_tensor), dim=1)
+                cur_question_tensor = torch.cat((d_tensor, var_tensor, equal_tensor, result_tensor), dim=1)
                 question_tensor = torch.cat((question_tensor, cur_question_tensor), dim=0)
-    
-    
+
+                if bidir:
+                    cur_question_tensor = torch.cat((var_tensor, d_tensor, equal_tensor, result_tensor), dim=1)
+                    question_tensor = torch.cat((question_tensor, cur_question_tensor), dim=0)
+
     print(f"Number of questions: {question_tensor.size(0)}")
     return question_tensor.long()
 
@@ -317,10 +320,6 @@ def create_data(int_by_set, prop_val=0.1, num_questions=6):
 
         elif dataset in ['Df4']:
             cur_defs = create_definitions(cur_integers, reliable_tag=False, reliable_def=True)
-
-        # pad definitions to match question size
-
-        cur_defs = F.pad(cur_defs, (0, 1), value=2*DataParams.mod + Tokens.padding)
 
         # split into train and validation set
 
@@ -597,7 +596,7 @@ if __name__ == '__main__':
 
     new_transformer_config = transformer_config
     new_transformer_config.update(dict(
-        d_vocab=2*mod + 4,  # 3 special tokens + mod vars
+        d_vocab=(DataParams.num_alias_groups+1)*mod + 4,  # 3 special tokens + mod vars
     ))
     new_cfg = HookedTransformerConfig(**new_transformer_config)
     new_model = HookedTransformer(new_cfg)

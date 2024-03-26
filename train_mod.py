@@ -6,10 +6,8 @@ from dataclasses import dataclass, asdict
 import numpy as np
 import time
 import os
-from tqdm.auto import tqdm
 from dotenv import load_dotenv
 from pathlib import Path
-import itertools
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -18,12 +16,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 class DataParams:
     mod: int = 120
     operation: str = "prod"
+    num_alias_groups: int = 1 # number of different aliases per integer
 
 
 @dataclass
 class Tokens:
     # diffs from nv
     equal: int = 0
+    num_alias_groups: int = 1 # number of different aliases per integer
 
 
 @dataclass
@@ -57,7 +57,7 @@ default_transformer_config = dict(
 default_transformer_config = dict(
     d_vocab=512,
     n_layers=2,
-    d_model=2**7,
+    d_model=2**8,
     d_head=2**7,
     n_heads=4,
     d_mlp=2**8,
@@ -228,7 +228,7 @@ if __name__ == "__main__":
     tokens = Tokens()
     transformer_config = default_transformer_config
     transformer_config.update(dict(
-        d_vocab=2*data_params.mod + 4,  # include tokens for oocl later
+        d_vocab=(data_params.num_alias_groups+1)*data_params.mod + 4,  # include tokens for oocl later
     ))
     train_params = TrainParams()
 
@@ -258,7 +258,7 @@ if __name__ == "__main__":
         valid_loader = make_data(train_params.batch_size, x_vv, y_vv, z_vv, valid_vv)
         wandb.init(
             # set the wandb project where this run will be logged
-            project="luan_tests",
+            project="f=luan_tests",
             entity=os.getenv("WANDB_ENTITY"),
             name=name,
             # track hyperparameters and run metadata
