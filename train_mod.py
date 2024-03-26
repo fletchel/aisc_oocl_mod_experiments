@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 class DataParams:
     mod: int = 120
     operation: str = "prod"
+    num_alias_groups: int = 1 # number of different aliases per integer
 
 
 @dataclass
